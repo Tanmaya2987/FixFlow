@@ -69,6 +69,10 @@ from rag_service import (
     warmup_embedding_model,
 )
 
+from priority_service import priority_service
+from ml_models.category_classifier import predict_category
+from sentiment_service import predict_sentiment
+
 # ==================================================
 # APPLICATION
 # ==================================================
@@ -140,7 +144,6 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
-        "https://hidden-cadaver-pjgxrpv7gvqqf7qw5-5173.app.github.dev",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -773,7 +776,6 @@ def get_platform_metrics(
 # ==================================================
 # TICKETS
 # ==================================================
-
 @app.post(
     "/api/v1/tickets",
     response_model=TicketOut,
@@ -786,13 +788,46 @@ def create_ticket(
 ):
     tenant_id = require_tenant_user(current_user)
 
+    ticket_text = f"{ticket_data.subject}\n{ticket_data.body}"
+
+    # 1. Predict ticket category
+    category_result = predict_category(ticket_text)
+
+    # 2. Predict ticket priority
+    priority_result = classify_ticket_priority(
+        ticket_data.subject,
+        ticket_data.body,
+    )
+
+    # 3. Predict customer sentiment
+    try:
+        sentiment_result = predict_sentiment(ticket_text)
+        predicted_sentiment = sentiment_result["sentiment"]
+    except Exception:
+        logging.exception("Sentiment prediction failed")
+        predicted_sentiment = None
+
+    # 4. Prepare ticket data
     data = ticket_data.model_dump(
         exclude_unset=True,
         exclude={"tenant_id"},
     )
 
-    ticket = Ticket(**data, tenant_id=tenant_id)
+    # 5. Save all three model predictions
+    ticket = Ticket(
+        **data,
+        tenant_id=tenant_id,
+        category=category_result["category_id"],
+        priority=priority_result["priority"],
+        sentiment=predicted_sentiment,
+        status=(
+            TicketStatus.pending_agent
+            if priority_result["needs_review"]
+            else TicketStatus.open
+        ),
+    )
 
+    # 6. Save ticket in database
     db.add(ticket)
     db.commit()
     db.refresh(ticket)
@@ -810,8 +845,9 @@ def create_aurora_ticket(
     db: Session = Depends(get_db),
     tenant_id: uuid.UUID = Depends(verify_aurora_integration),
 ):
-    """Save an integration ticket and auto-reply only when customer-safe."""
-    # Confirm the configured Aurora Bank tenant exists.
+    """Classify an integration ticket and auto-reply only when customer-safe."""
+
+    # 1. Confirm the configured Aurora Bank tenant exists.
     tenant = db.get(Tenant, tenant_id)
 
     if tenant is None:
@@ -820,25 +856,95 @@ def create_aurora_ticket(
             detail="Configured Aurora Bank tenant does not exist",
         )
 
-    # 1. Always save the ticket first, so the company sees every ticket.
+    ticket_text = f"{ticket_data.subject}\n{ticket_data.body}"
+
+    # 2. Predict ticket category.
+    try:
+        category_result = predict_category(ticket_text)
+        predicted_category = category_result["category_id"]
+
+    except Exception as exc:
+        logger.exception("Category prediction failed for Aurora ticket")
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket category classification service is unavailable",
+        ) from exc
+
+    # 3. Predict ticket priority.
+    try:
+        priority_result = classify_ticket_priority(
+            ticket_data.subject,
+            ticket_data.body,
+        )
+
+        predicted_priority = priority_result["priority"]
+        needs_review = priority_result["needs_review"]
+
+    except Exception as exc:
+        logger.exception("Priority prediction failed for Aurora ticket")
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Ticket priority classification service is unavailable",
+        ) from exc
+
+    # 4. Predict customer sentiment.
+    try:
+        sentiment_result = predict_sentiment(ticket_text)
+        predicted_sentiment = sentiment_result["sentiment"]
+
+    except Exception:
+        logger.exception("Sentiment prediction failed for Aurora ticket")
+        predicted_sentiment = None
+
+    # 5. Save the ticket with all three predictions.
     ticket = Ticket(
         subject=ticket_data.subject,
         body=ticket_data.body,
         tenant_id=tenant_id,
-        status=TicketStatus.new,
+        category=predicted_category,
+        priority=predicted_priority,
+        sentiment=predicted_sentiment,
+        status=(
+            TicketStatus.pending_agent
+            if needs_review
+            else TicketStatus.new
+        ),
     )
 
-    db.add(ticket)
-    db.commit()
-    db.refresh(ticket)
+    try:
+        db.add(ticket)
+        db.commit()
+        db.refresh(ticket)
+
+    except Exception:
+        db.rollback()
+        logger.exception("Aurora ticket creation failed")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to create the ticket",
+        )
+
+    # 6. Critical or uncertain priority predictions go directly to an agent.
+    if needs_review:
+        logger.info(
+            "Ticket %s sent to an agent: priority=%s, confidence=%s",
+            ticket.id,
+            predicted_priority,
+            priority_result.get("confidence"),
+        )
+
+        return ticket
 
     ticket_text = (
         f"Ticket subject: {ticket.subject}\n\n"
         f"Customer issue:\n{ticket.body}"
     )
 
+    # 7. Search company documents and generate a possible answer.
     try:
-        # 2. Search only this company's documents and draft an answer.
         result = answer_question(
             tenant_id=tenant_id,
             query=ticket_text,
@@ -849,6 +955,7 @@ def create_aurora_ticket(
 
         reply = str(result.get("answer") or "").strip()
         retrieved_sources = result.get("citations")
+
         has_retrieved_sources = (
             isinstance(retrieved_sources, list)
             and bool(retrieved_sources)
@@ -863,7 +970,7 @@ def create_aurora_ticket(
             )
         )
 
-        # 3. Collect every reason the ticket needs a human.
+        # 8. Collect reasons for human review.
         reasons = []
 
         if result.get("insufficient_evidence"):
@@ -878,14 +985,13 @@ def create_aurora_ticket(
         if not has_retrieved_sources:
             reasons.append("missing_or_invalid_sources")
 
-        # Only run the safety check when everything else already passed.
         if not reasons and reply_requires_internal_action(
             ticket_text,
             reply,
         ):
             reasons.append("reply_safety_check")
 
-        # 4. Decide: answer the customer, or hand over to an agent.
+        # 9. Auto-answer only when all checks pass.
         if reasons:
             logger.info(
                 "Ticket %s routed to an agent: %s; citation_count=%s",
@@ -897,14 +1003,17 @@ def create_aurora_ticket(
                     else 0
                 ),
             )
+
             ticket.reply = None
             ticket.status = TicketStatus.pending_agent
+
         else:
             logger.info(
                 "Ticket %s received an automatic answer; citation_count=%s",
                 ticket.id,
                 len(retrieved_sources),
             )
+
             ticket.reply = reply
             ticket.status = TicketStatus.auto_answered
 
@@ -913,11 +1022,14 @@ def create_aurora_ticket(
             "Automatic customer-safe response generation failed for ticket %s",
             ticket.id,
         )
+
         ticket.reply = None
         ticket.status = TicketStatus.pending_agent
 
+    # 10. Save the final response and status.
     db.commit()
     db.refresh(ticket)
+
     return ticket
 
 
@@ -1626,3 +1738,24 @@ def delete_company(
             status_code=500,
             detail="Unable to delete company. Check dependent records and database constraints.",
         )
+
+
+
+def classify_ticket_priority(subject: str, body: str):
+    ticket_text = f"""
+    Ticket Subject: {subject}
+
+    Customer Issue: {body}
+    """
+
+    try:
+        return priority_service.predict_priority(ticket_text)
+
+    except Exception:
+        logger.exception("Priority classification failed")
+
+        return {
+            "priority": None,
+            "confidence": None,
+            "needs_review": True,
+        }
