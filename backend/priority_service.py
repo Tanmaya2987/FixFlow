@@ -1,61 +1,77 @@
+import re
 import joblib
 import numpy as np
 from pathlib import Path
 
 from embedding_service import embedding_service
+
 MODEL_PATH = Path(__file__).resolve().parent / "priority_model.joblib"
 
 
 class PriorityService:
 
     def __init__(self):
-        self.saved_data = joblib.load(MODEL_PATH)
+        d = joblib.load(MODEL_PATH)
 
-        # Find the member selected as the winning model.
-        winner_name = self.saved_data["winner"]
+        self.classes = list(d["classes"])
+        self.minilm_name = d["encoders"]["minilm"]
 
-        winning_member = next(
-            (
-                member
-                for member in self.saved_data["members"]
-                if member.get("name") == winner_name
-            ),
-            None,
+        members = {m["name"]: m["clf"] for m in d["members"]}
+
+        self.tfidf = members["tfidf"]
+        self.minilm = members["minilm_C2"]
+
+        for clf in (self.tfidf, self.minilm):
+            assert list(clf.classes_) == self.classes, "class order mismatch"
+
+        self.use_rule = d.get("use_rule", False)
+        self.rules = [
+            re.compile(p, re.IGNORECASE)
+            for p in d.get("critical_patterns", [])
+        ]
+
+        print("Loaded ensemble:", d["winner"])
+
+    def _rule_hit(self, text):
+        return self.use_rule and any(
+            r.search(text) for r in self.rules
         )
-
-        if winning_member is None:
-            raise ValueError(
-                f"Winning model '{winner_name}' not found in saved artifact."
-            )
-
-        # Extract the actual trained classifier.
-        self.classifier = winning_member["clf"]
-
-        if not hasattr(self.classifier, "predict"):
-            raise TypeError("Loaded classifier does not support predict().")
-
-        print("Loaded model:", winner_name)
-        print("Classifier type:", type(self.classifier).__name__)
 
     def predict_priority(self, ticket_text):
 
-        embedding = embedding_service.generate_embeddings(
-            [ticket_text]
+        emb = embedding_service.generate_embeddings(
+            [ticket_text],
+            model_name=self.minilm_name
         )
 
-        prediction = self.classifier.predict(embedding)[0]
+        P = (
+            self.tfidf.predict_proba([ticket_text])
+            + self.minilm.predict_proba(emb)
+        ) / 2
 
-        probabilities = self.classifier.predict_proba(embedding)[0]
+        probs = P[0]
 
-        confidence = float(np.max(probabilities))
+        idx = int(np.argmax(probs))
+        priority = self.classes[idx]
+        confidence = float(probs[idx])
+
+        rule_applied = False
+
+        if priority != "Critical" and self._rule_hit(ticket_text):
+            priority = "Critical"
+            rule_applied = True
+            confidence = float(
+                probs[self.classes.index("Critical")]
+            )
 
         return {
-            "priority": str(prediction),
+            "priority": priority,
             "confidence": round(confidence, 4),
-            "needs_review": (
-                str(prediction) == "Critical"
-                or confidence < self.saved_data["review_threshold"]
-            ),
+            "probs": {
+                c: round(float(p), 3)
+                for c, p in zip(self.classes, probs)
+            },
+            "rule_applied": rule_applied
         }
 
 

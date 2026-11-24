@@ -880,7 +880,6 @@ def create_aurora_ticket(
         )
 
         predicted_priority = priority_result["priority"]
-        needs_review = priority_result["needs_review"]
 
     except Exception as exc:
         logger.exception("Priority prediction failed for Aurora ticket")
@@ -907,11 +906,7 @@ def create_aurora_ticket(
         category=predicted_category,
         priority=predicted_priority,
         sentiment=predicted_sentiment,
-        status=(
-            TicketStatus.pending_agent
-            if needs_review
-            else TicketStatus.new
-        ),
+        status=TicketStatus.new,
     )
 
     try:
@@ -928,16 +923,7 @@ def create_aurora_ticket(
             detail="Unable to create the ticket",
         )
 
-    # 6. Critical or uncertain priority predictions go directly to an agent.
-    if needs_review:
-        logger.info(
-            "Ticket %s sent to an agent: priority=%s, confidence=%s",
-            ticket.id,
-            predicted_priority,
-            priority_result.get("confidence"),
-        )
-
-        return ticket
+    # 6. Critical or uncertain priority predictions go directly to an agent
 
     ticket_text = (
         f"Ticket subject: {ticket.subject}\n\n"
