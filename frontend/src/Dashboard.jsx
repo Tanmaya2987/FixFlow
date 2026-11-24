@@ -30,6 +30,27 @@ const EMPTY_METRICS = {
   resolved_tickets: 0,
 };
 
+const CATEGORY_NAMES = {
+  BANKING: "Banking & Account Services",
+  CARDS: "Cards & Payments",
+  DIGITAL_BANKING: "Digital & Online Banking",
+  TRANSFERS: "Fund Transfers & Transactions",
+  LOANS: "Loans & Credit Services",
+  FRAUD: "Fraud & Disputes",
+  DEPOSITS: "Deposits & Investments",
+  COMPLIANCE: "KYC & Compliance",
+  TECHNICAL: "Technical Support",
+  ACCOUNT_ACCESS: "Account Access & Authentication",
+  BILLING: "Billing & Invoicing",
+  REFUNDS: "Refunds & Cancellations",
+  SERVICE_REQUEST: "General Service Requests",
+  PRODUCT: "Product & Service Information",
+  DOCUMENTATION: "Documents & Verification",
+  NETWORK: "Network & Connectivity",
+  HARDWARE: "Hardware & Device Support",
+  OTHER: "Other / Unclassified",
+};
+
 function readStoredUser() {
   try {
     const raw = localStorage.getItem("user");
@@ -120,6 +141,45 @@ function getTicketDescription(ticket) {
   return "";
 }
 
+function getTicketCategory(ticket) {
+  if (ticket?.category_name) {
+    return ticket.category_name;
+  }
+
+  if (!ticket?.category) {
+    return "Unclassified";
+  }
+
+  return (
+    CATEGORY_NAMES[ticket.category] ||
+    String(ticket.category).replaceAll("_", " ")
+  );
+}
+
+function getTicketSentiment(ticket) {
+  const sentiment = ticket?.sentiment;
+
+  if (!sentiment) {
+    return "Not analyzed";
+  }
+
+  return String(sentiment)
+    .replaceAll("_", " ")
+    .replaceAll("-", " ")
+    .toLowerCase()
+    .replace(/\b\w/g, (character) => character.toUpperCase());
+}
+
+function sentimentClass(sentiment) {
+  const normalized = String(sentiment || "").toLowerCase().trim();
+
+  if (normalized.includes("positive")) return "positive";
+  if (normalized.includes("negative")) return "negative";
+  if (normalized.includes("neutral")) return "neutral";
+
+  return "unknown";
+}
+
 function getRequestId(request) {
   return request?.id ?? request?.request_id;
 }
@@ -154,6 +214,16 @@ function EmptyState({ children }) {
   return <div className="fx-empty-state">{children}</div>;
 }
 
+function SentimentBadge({ sentiment }) {
+  const sentimentType = sentimentClass(sentiment);
+
+  return (
+    <span className={`fx-sentiment fx-sentiment-${sentimentType}`}>
+      {getTicketSentiment({ sentiment })}
+    </span>
+  );
+}
+
 function TicketTable({
   tickets,
   onSelect,
@@ -173,6 +243,8 @@ function TicketTable({
           <tr>
             <th>Ticket</th>
             <th>Title</th>
+            <th>Category</th>
+            <th>Sentiment</th>
             <th>Status</th>
             <th>Priority</th>
             <th>Created</th>
@@ -191,6 +263,10 @@ function TicketTable({
               <tr key={id}>
                 <td>#{String(id ?? "—").slice(0, 8)}</td>
                 <td>{ticket.title || ticket.subject || "Untitled ticket"}</td>
+                <td>{getTicketCategory(ticket)}</td>
+                <td>
+                  <SentimentBadge sentiment={ticket.sentiment} />
+                </td>
                 <td>
                   <span
                     className={`fx-status fx-status-${statusClass(
@@ -296,14 +372,29 @@ function TicketDetails({
           <span className="fx-detail-label">Ticket ID</span>
           <p>{id ?? "—"}</p>
         </div>
+
+        <div>
+          <span className="fx-detail-label">Category</span>
+          <p>{getTicketCategory(ticket)}</p>
+        </div>
+
+        <div>
+          <span className="fx-detail-label">Sentiment</span>
+          <p>
+            <SentimentBadge sentiment={ticket.sentiment} />
+          </p>
+        </div>
+
         <div>
           <span className="fx-detail-label">Status</span>
           <p>{ticket.status || "Unknown"}</p>
         </div>
+
         <div>
           <span className="fx-detail-label">Priority</span>
           <p>{ticket.priority || "Normal"}</p>
         </div>
+
         <div>
           <span className="fx-detail-label">Created</span>
           <p>{formatDate(ticket.created_at)}</p>
@@ -1162,10 +1253,10 @@ export default function Dashboard({ onNavigate }) {
   if (!roleDetails) return null;
 
   const openCount = tickets.filter(
-    (ticket) =>
-      !["closed", "resolved"].includes(
-        String(ticket.status || "").toLowerCase()
-      )
+  (ticket) =>
+    !["closed", "resolved", "auto_answered"].includes(
+      String(ticket.status || "").toLowerCase()
+    )
   ).length;
 
   const urgentCount = tickets.filter(

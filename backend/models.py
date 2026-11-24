@@ -114,6 +114,7 @@ class Ticket(Base):
     reply: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     category: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
     priority: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    sentiment: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     assigned_to_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         ForeignKey("users.id", ondelete="SET NULL"),
         nullable=True,
@@ -133,7 +134,6 @@ class Ticket(Base):
         back_populates="ticket",
         cascade="all, delete-orphan",
     )
-
 
 class Document(Base):
     """
@@ -175,6 +175,8 @@ class Document(Base):
     tenant: Mapped["Tenant"] = relationship(
         back_populates="documents",
     )
+
+    
 class Draft(Base):
     __tablename__ = "drafts"
 

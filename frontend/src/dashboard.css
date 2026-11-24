@@ -1186,3 +1186,33 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+.fx-sentiment {
+  display: inline-block;
+  padding: 5px 10px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.fx-sentiment-positive {
+  color: #15803d;
+  background: #dcfce7;
+}
+
+.fx-sentiment-negative {
+  color: #b91c1c;
+  background: #fee2e2;
+}
+
+.fx-sentiment-neutral {
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+.fx-sentiment-unknown {
+  color: #64748b;
+  background: #f1f5f9;
+}

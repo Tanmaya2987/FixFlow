@@ -3,7 +3,7 @@ import re
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, EmailStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, EmailStr, field_validator, computed_field
 from sqlalchemy import select, func
 
 from models import TicketStatus
@@ -51,9 +51,35 @@ class TicketOut(BaseModel):
     reply: Optional[str] = None
     category: Optional[str] = None
     priority: Optional[str] = None
+    sentiment: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
+    @computed_field
+    @property
+    def category_name(self) -> Optional[str]:
+        category_names = {
+            "BANKING": "Banking & Account Services",
+            "CARDS": "Cards & Payments",
+            "DIGITAL_BANKING": "Digital & Online Banking",
+            "TRANSFERS": "Fund Transfers & Transactions",
+            "LOANS": "Loans & Credit Services",
+            "FRAUD": "Fraud & Disputes",
+            "DEPOSITS": "Deposits & Investments",
+            "COMPLIANCE": "KYC & Compliance",
+            "TECHNICAL": "Technical Support",
+            "ACCOUNT_ACCESS": "Account Access & Authentication",
+            "BILLING": "Billing & Invoicing",
+            "REFUNDS": "Refunds & Cancellations",
+            "SERVICE_REQUEST": "General Service Requests",
+            "PRODUCT": "Product & Service Information",
+            "DOCUMENTATION": "Documents & Verification",
+            "NETWORK": "Network & Connectivity",
+            "HARDWARE": "Hardware & Device Support",
+            "OTHER": "Other / Unclassified"
+        }
+
+        return category_names.get(self.category) if self.category else None
 
 class TicketIntakeOut(TicketOut):
     pass
