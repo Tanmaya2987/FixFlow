@@ -3,11 +3,14 @@ import logging
 import secrets
 import uuid
 import os
-
+from ml_models.priority_service import priority_service
+from sentiment_service import predict_sentiment
+from ml_models.category_classifier import predict_category
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from sqlalchemy import delete
+from services.assignment import assign_ticket
 from fastapi import (
     Depends,
     FastAPI,
@@ -24,7 +27,7 @@ from fastapi.security import (
 )
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from database import get_db
 from models import (
@@ -68,10 +71,6 @@ from rag_service import (
     reply_requires_internal_action,
     warmup_embedding_model,
 )
-
-from priority_service import priority_service
-from ml_models.category_classifier import predict_category
-from sentiment_service import predict_sentiment
 
 # ==================================================
 # APPLICATION
@@ -144,7 +143,6 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:5174",
         "http://127.0.0.1:5174",
-         "https://urban-computing-machine-r4rjgp97r9pvc5j4w-5173.app.github.dev",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -198,6 +196,30 @@ def require_company_admin(current_user: User) -> uuid.UUID:
         )
 
     return require_tenant_user(current_user)
+
+
+def category_names(user: User) -> list[str]:
+    """Return a user's supported categories as plain strings.
+
+    Returning ORM objects directly makes FastAPI's jsonable_encoder walk
+    User -> category -> User -> ... until it hits RecursionError.
+    """
+    names: list[str] = []
+
+    for item in user.supported_categories or []:
+        if isinstance(item, str):
+            names.append(item)
+            continue
+
+        # Category link/association object: try common attribute names.
+        value = (
+            getattr(item, "category", None)
+            or getattr(item, "name", None)
+            or getattr(item, "value", None)
+        )
+        names.append(str(getattr(value, "value", value)))
+
+    return names
 
 
 def get_ticket_or_404(
@@ -688,6 +710,7 @@ def create_tenant(
 # COMPANY EMPLOYEES
 # ==================================================
 
+
 @app.get("/api/v1/tenants/users")
 def list_company_users(
     db: Session = Depends(get_db),
@@ -697,6 +720,7 @@ def list_company_users(
 
     users = db.scalars(
         select(User)
+        .options(selectinload(User.category_links))
         .where(
             User.tenant_id == tenant_id,
             User.role != UserRole.platform_admin,
@@ -711,6 +735,9 @@ def list_company_users(
             "email": user.email,
             "role": user.role.value,
             "tenant_id": str(user.tenant_id),
+            # Plain strings only: returning ORM objects here caused a
+            # RecursionError in FastAPI's jsonable_encoder.
+            "supported_categories": category_names(user),
             "created_at": user.created_at,
         }
         for user in users
@@ -777,6 +804,8 @@ def get_platform_metrics(
 # ==================================================
 # TICKETS
 # ==================================================
+
+
 @app.post(
     "/api/v1/tickets",
     response_model=TicketOut,
@@ -789,51 +818,154 @@ def create_ticket(
 ):
     tenant_id = require_tenant_user(current_user)
 
+    tenant = db.get(Tenant, tenant_id)
+
+    if tenant is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organization not found",
+        )
+
     ticket_text = f"{ticket_data.subject}\n{ticket_data.body}"
 
-    # 1. Predict ticket category
     category_result = predict_category(ticket_text)
 
-    # 2. Predict ticket priority
     priority_result = classify_ticket_priority(
         ticket_data.subject,
         ticket_data.body,
     )
 
-    # 3. Predict customer sentiment
     try:
         sentiment_result = predict_sentiment(ticket_text)
         predicted_sentiment = sentiment_result["sentiment"]
     except Exception:
-        logging.exception("Sentiment prediction failed")
+        logger.exception("Sentiment prediction failed")
         predicted_sentiment = None
 
-    # 4. Prepare ticket data
     data = ticket_data.model_dump(
         exclude_unset=True,
         exclude={"tenant_id"},
     )
 
-    # 5. Save all three model predictions
     ticket = Ticket(
         **data,
         tenant_id=tenant_id,
         category=category_result["category_id"],
         priority=priority_result["priority"],
         sentiment=predicted_sentiment,
-        status=(
-            TicketStatus.pending_agent
-            if priority_result["needs_review"]
-            else TicketStatus.open
-        ),
+        status=TicketStatus.new,
     )
 
-    # 6. Save ticket in database
-    db.add(ticket)
-    db.commit()
-    db.refresh(ticket)
+    try:
+        db.add(ticket)
+        db.commit()
+        db.refresh(ticket)
+
+    except Exception:
+        db.rollback()
+        logger.exception("Ticket creation failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to create ticket",
+        )
+
+    ticket_context = (
+        f"Ticket subject: {ticket.subject}\n\n"
+        f"Customer issue:\n{ticket.body}"
+    )
+
+    try:
+        result = answer_question(
+            tenant_id=tenant_id,
+            query=ticket_context,
+            retrieval_query=f"{ticket.subject}\n{ticket.body}",
+            company_name=tenant.name,
+            verify_evidence=True,
+        )
+
+        reply = str(result.get("answer") or "").strip()
+        retrieved_sources = result.get("citations")
+
+        has_retrieved_sources = (
+            isinstance(retrieved_sources, list)
+            and bool(retrieved_sources)
+            and all(
+                isinstance(source, dict)
+                and isinstance(source.get("source"), str)
+                and bool(source["source"].strip())
+                and source["source"].strip().lower() != "unknown source"
+                and bool(source.get("document_id"))
+                and bool(source.get("chunk_key"))
+                for source in retrieved_sources
+            )
+        )
+
+        reasons = []
+
+        if priority_result.get("needs_review"):
+            reasons.append("priority_requires_review")
+
+        if result.get("insufficient_evidence"):
+            reasons.append("insufficient_evidence")
+
+        if result.get("evidence_check_failed"):
+            reasons.append("answer_not_supported_by_evidence")
+
+        if not reply:
+            reasons.append("empty_reply")
+
+        if not has_retrieved_sources:
+            reasons.append("missing_or_invalid_sources")
+
+        if not reasons and reply_requires_internal_action(
+            ticket_context,
+            reply,
+        ):
+            reasons.append("reply_safety_check")
+
+        if reasons:
+            logger.info(
+                "Ticket %s routed to division: %s",
+                ticket.id,
+                ",".join(reasons),
+            )
+
+            ticket.reply = None
+            ticket.status = TicketStatus.pending_agent
+
+        else:
+            ticket.reply = reply
+            ticket.status = TicketStatus.auto_answered
+
+    except Exception:
+        logger.exception(
+            "RAG processing failed for ticket %s",
+            ticket.id,
+        )
+
+        ticket.reply = None
+        ticket.status = TicketStatus.pending_agent
+
+    if ticket.status == TicketStatus.pending_agent:
+        assign_ticket(db, ticket)
+
+    try:
+        db.commit()
+        db.refresh(ticket)
+
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Final ticket processing failed for %s",
+            ticket.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to complete ticket processing",
+        )
 
     return ticket
+
 
 
 @app.post(
@@ -1013,9 +1145,26 @@ def create_aurora_ticket(
         ticket.reply = None
         ticket.status = TicketStatus.pending_agent
 
-    # 10. Save the final response and status.
-    db.commit()
-    db.refresh(ticket)
+    # 10. Assign an employee only when human assistance is required.
+    if ticket.status == TicketStatus.pending_agent:
+        assign_ticket(db, ticket)
+
+    # 11. Save the final response, status, and assignment.
+    try:
+        db.commit()
+        db.refresh(ticket)
+
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Final Aurora ticket processing failed for ticket %s",
+            ticket.id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to complete ticket processing",
+        )
 
     return ticket
 
@@ -1030,11 +1179,21 @@ def list_tickets(
 ):
     tenant_id = require_tenant_user(current_user)
 
+    query = select(Ticket).where(
+        Ticket.tenant_id == tenant_id
+    )
+
+    # Agents can only see tickets assigned to themselves.
+    if current_user.role == UserRole.agent:
+        query = query.where(
+            Ticket.assigned_to_id == current_user.id
+        )
+
+    # Company admins can see all tickets in their organization.
     return db.scalars(
-        select(Ticket)
-        .where(Ticket.tenant_id == tenant_id)
-        .order_by(Ticket.created_at.desc())
+        query.order_by(Ticket.created_at.desc())
     ).all()
+
 
 
 @app.get(
@@ -1048,7 +1207,18 @@ def get_ticket(
 ):
     tenant_id = require_tenant_user(current_user)
 
-    return get_ticket_or_404(db, tenant_id, ticket_id)
+    ticket = get_ticket_or_404(db, tenant_id, ticket_id)
+
+    if (
+        current_user.role == UserRole.agent
+        and ticket.assigned_to_id != current_user.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+
+    return ticket
 
 
 @app.patch(
@@ -1064,8 +1234,19 @@ def update_ticket(
     tenant_id = require_tenant_user(current_user)
     ticket = get_ticket_or_404(db, tenant_id, ticket_id)
 
+    if (
+        current_user.role == UserRole.agent
+        and ticket.assigned_to_id != current_user.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+
     updates = ticket_data.model_dump(exclude_unset=True)
-    updates.pop("tenant_id", None)
+    if current_user.role == UserRole.agent:
+        updates.pop("assigned_to_id", None)
+    # updates.pop("tenant_id", None)
 
     if updates.get("assigned_to_id") is not None:
         assignee = db.scalar(
@@ -1141,6 +1322,16 @@ def generate_ticket_ai_answer(
     tenant_id = require_tenant_user(current_user)
     ticket = get_ticket_or_404(db, tenant_id, ticket_id)
 
+    # Agents can generate AI answers only for their assigned tickets.
+    if (
+        current_user.role == UserRole.agent
+        and ticket.assigned_to_id != current_user.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Ticket not found",
+        )
+
     tenant = db.get(Tenant, tenant_id)
     company_name = tenant.name if tenant else "the company"
 
@@ -1148,7 +1339,13 @@ def generate_ticket_ai_answer(
         f"Ticket subject: {ticket.subject}\n\n"
         f"Customer issue:\n{ticket.body}"
     )
-    agent_question = (request.question or "").strip() if request else ""
+
+    agent_question = (
+        (request.question or "").strip()
+        if request
+        else ""
+    )
+
     question = (
         f"{ticket_context}\n\nAgent question:\n{agent_question}"
         if agent_question
@@ -1576,6 +1773,7 @@ def delete_invitation(
     return {"message": "Invitation deleted successfully"}
 
 
+
 @app.post("/api/v1/invitations/accept")
 def accept_invitation(
     invitation_data: InvitationAccept,
@@ -1634,7 +1832,11 @@ def accept_invitation(
             role=UserRole.agent,
         )
 
+        # Save employee categories through the many-to-many relationship.
+        user.supported_categories = invitation_data.categories
+
         db.add(user)
+
         invitation.accepted_at = now
 
         db.commit()
@@ -1645,6 +1847,7 @@ def accept_invitation(
             "user_id": str(user.id),
             "email": user.email,
             "role": user.role.value,
+            "categories": category_names(user),
         }
 
     except Exception:
@@ -1725,7 +1928,6 @@ def delete_company(
             status_code=500,
             detail="Unable to delete company. Check dependent records and database constraints.",
         )
-
 
 
 def classify_ticket_priority(subject: str, body: str):
